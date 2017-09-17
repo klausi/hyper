@@ -11,10 +11,17 @@ use futures::unsync::oneshot;
 
 use http::{KeepAlive, KA};
 
-pub struct Pool<T> {
+use std::fmt::Debug;
+
+#[derive(Debug)]
+pub struct Pool<T>
+where
+    T: Debug,
+{
     inner: Rc<RefCell<PoolInner<T>>>,
 }
 
+#[derive(Debug)]
 struct PoolInner<T> {
     enabled: bool,
     idle: HashMap<Rc<String>, Vec<Entry<T>>>,
@@ -22,7 +29,10 @@ struct PoolInner<T> {
     timeout: Option<Duration>,
 }
 
-impl<T: Clone> Pool<T> {
+impl<T: Clone> Pool<T>
+where
+    T: Debug,
+{
     pub fn new(enabled: bool, timeout: Option<Duration>) -> Pool<T> {
         Pool {
             inner: Rc::new(RefCell::new(PoolInner {
@@ -66,9 +76,7 @@ impl<T: Clone> Pool<T> {
 
         match entry {
             Some(entry) => {
-                inner.idle.entry(key)
-                     .or_insert(Vec::new())
-                     .push(entry);
+                inner.idle.entry(key).or_insert(Vec::new()).push(entry);
             }
             None => trace!("Pool::put found parked {:?}", key),
         }
@@ -104,42 +112,57 @@ impl<T: Clone> Pool<T> {
 
     fn park(&mut self, key: Rc<String>, tx: oneshot::Sender<Entry<T>>) {
         trace!("Pool::park {:?}", key);
-        self.inner.borrow_mut()
-            .parked.entry(key)
+        self.inner
+            .borrow_mut()
+            .parked
+            .entry(key)
             .or_insert(VecDeque::new())
             .push_back(tx);
     }
 }
 
-impl<T> Clone for Pool<T> {
+impl<T> Clone for Pool<T>
+where
+    T: Debug,
+{
     fn clone(&self) -> Pool<T> {
-        Pool {
-            inner: self.inner.clone(),
-        }
+        Pool { inner: self.inner.clone() }
     }
 }
 
 #[derive(Clone)]
-pub struct Pooled<T> {
+pub struct Pooled<T>
+where
+    T: Debug,
+{
     entry: Entry<T>,
     key: Rc<String>,
     pool: Pool<T>,
 }
 
-impl<T> Deref for Pooled<T> {
+impl<T> Deref for Pooled<T>
+where
+    T: Debug,
+{
     type Target = T;
     fn deref(&self) -> &T {
         &self.entry.value
     }
 }
 
-impl<T> DerefMut for Pooled<T> {
+impl<T> DerefMut for Pooled<T>
+where
+    T: Debug,
+{
     fn deref_mut(&mut self) -> &mut T {
         &mut self.entry.value
     }
 }
 
-impl<T: Clone> KeepAlive for Pooled<T> {
+impl<T: Clone> KeepAlive for Pooled<T>
+where
+    T: Debug,
+{
     fn busy(&mut self) {
         self.entry.status.set(TimedKA::Busy);
     }
@@ -170,7 +193,10 @@ impl<T: Clone> KeepAlive for Pooled<T> {
     }
 }
 
-impl<T> fmt::Debug for Pooled<T> {
+impl<T> fmt::Debug for Pooled<T>
+where
+    T: Debug,
+{
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("Pooled")
             .field("status", &self.entry.status.get())
@@ -179,7 +205,10 @@ impl<T> fmt::Debug for Pooled<T> {
     }
 }
 
-impl<T: Clone> BitAndAssign<bool> for Pooled<T> {
+impl<T: Clone> BitAndAssign<bool> for Pooled<T>
+where
+    T: Debug,
+{
     fn bitand_assign(&mut self, enabled: bool) {
         if !enabled {
             self.disable();
@@ -187,7 +216,7 @@ impl<T: Clone> BitAndAssign<bool> for Pooled<T> {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct Entry<T> {
     value: T,
     is_reused: bool,
@@ -201,13 +230,19 @@ enum TimedKA {
     Disabled,
 }
 
-pub struct Checkout<T> {
+pub struct Checkout<T>
+where
+    T: Debug,
+{
     key: Rc<String>,
     pool: Pool<T>,
     parked: Option<oneshot::Receiver<Entry<T>>>,
 }
 
-impl<T: Clone> Future for Checkout<T> {
+impl<T: Clone> Future for Checkout<T>
+where
+    T: Debug,
+{
     type Item = Pooled<T>;
     type Error = io::Error;
 
@@ -219,8 +254,11 @@ impl<T: Clone> Future for Checkout<T> {
                 Ok(Async::Ready(entry)) => {
                     trace!("Checkout::poll found client in relay for {:?}", self.key);
                     return Ok(Async::Ready(self.pool.reuse(self.key.clone(), entry)));
-                },
-                Ok(Async::NotReady) => (),
+                }
+                Ok(Async::NotReady) => {
+                    trace!("Async not ready for {:?}", self.key);
+                    ()
+                }
                 Err(_canceled) => drop_parked = true,
             }
         }
@@ -229,31 +267,39 @@ impl<T: Clone> Future for Checkout<T> {
         }
         let expiration = Expiration::new(self.pool.inner.borrow().timeout);
         let key = &self.key;
-        trace!("Checkout::poll url = {:?}, expiration = {:?}", key, expiration.0);
+        trace!(
+            "Checkout::poll url = {:?}, expiration = {:?}",
+            key,
+            expiration.0
+        );
+        trace!("Klausi {:?}", self.pool);
         let mut should_remove = false;
-        let entry = self.pool.inner.borrow_mut().idle.get_mut(key).and_then(|list| {
-            trace!("Checkout::poll key found {:?}", key);
-            while let Some(entry) = list.pop() {
-                match entry.status.get() {
-                    TimedKA::Idle(idle_at) if !expiration.expires(idle_at) => {
-                        trace!("Checkout::poll found idle client for {:?}", key);
-                        should_remove = list.is_empty();
-                        return Some(entry);
-                    },
-                    _ => {
-                        trace!("Checkout::poll removing unacceptable pooled {:?}", key);
-                        // every other case the Entry should just be dropped
-                        // 1. Idle but expired
-                        // 2. Busy (something else somehow took it?)
-                        // 3. Disabled don't reuse of course
+        let entry = self.pool.inner.borrow_mut().idle.get_mut(key).and_then(
+            |list| {
+                trace!("Checkout::poll key found {:?}", key);
+                while let Some(entry) = list.pop() {
+                    match entry.status.get() {
+                        TimedKA::Idle(idle_at) if !expiration.expires(idle_at) => {
+                            trace!("Checkout::poll found idle client for {:?}", key);
+                            should_remove = list.is_empty();
+                            return Some(entry);
+                        }
+                        _ => {
+                            trace!("Checkout::poll removing unacceptable pooled {:?}", key);
+                            // every other case the Entry should just be dropped
+                            // 1. Idle but expired
+                            // 2. Busy (something else somehow took it?)
+                            // 3. Disabled don't reuse of course
+                        }
                     }
                 }
-            }
-            should_remove = true;
-            None
-        });
+                should_remove = true;
+                None
+            },
+        );
 
         if should_remove {
+            trace!("Remove from idle queue {:?}", key);
             self.pool.inner.borrow_mut().idle.remove(key);
         }
         match entry {
@@ -266,8 +312,18 @@ impl<T: Clone> Future for Checkout<T> {
                     self.parked = Some(rx);
                 }
                 Ok(Async::NotReady)
-            },
+            }
         }
+    }
+}
+
+impl<T> Drop for Checkout<T>
+where
+    T: Debug,
+{
+    fn drop(&mut self) {
+        //drop(self.parked.take());
+        self.pool.inner.borrow_mut().parked.remove(&self.key);
     }
 }
 
@@ -319,7 +375,8 @@ mod tests {
             ::std::thread::sleep(pool.inner.borrow().timeout.unwrap());
             assert!(pool.checkout(&key).poll().unwrap().is_not_ready());
             ::futures::future::ok::<(), ()>(())
-        }).wait().unwrap();
+        }).wait()
+            .unwrap();
     }
 
     #[test]
@@ -335,13 +392,23 @@ mod tests {
         pooled3.idle();
 
 
-        assert_eq!(pool.inner.borrow().idle.get(&key).map(|entries| entries.len()), Some(3));
+        assert_eq!(
+            pool.inner.borrow().idle.get(&key).map(
+                |entries| entries.len(),
+            ),
+            Some(3)
+        );
         ::std::thread::sleep(pool.inner.borrow().timeout.unwrap());
 
         pooled1.idle();
         pooled2.idle(); // idle after sleep, not expired
         pool.checkout(&key).poll().unwrap();
-        assert_eq!(pool.inner.borrow().idle.get(&key).map(|entries| entries.len()), Some(1));
+        assert_eq!(
+            pool.inner.borrow().idle.get(&key).map(
+                |entries| entries.len(),
+            ),
+            Some(1)
+        );
         pool.checkout(&key).poll().unwrap();
         assert!(pool.inner.borrow().idle.get(&key).is_none());
     }
@@ -353,15 +420,17 @@ mod tests {
         let pooled1 = pool.pooled(key.clone(), 41);
 
         let mut pooled = pooled1.clone();
-        let checkout = pool.checkout(&key).join(future::lazy(move || {
-            // the checkout future will park first,
-            // and then this lazy future will be polled, which will insert
-            // the pooled back into the pool
-            //
-            // this test makes sure that doing so will unpark the checkout
-            pooled.idle();
-            Ok(())
-        })).map(|(entry, _)| entry);
+        let checkout = pool.checkout(&key)
+            .join(future::lazy(move || {
+                // the checkout future will park first,
+                // and then this lazy future will be polled, which will insert
+                // the pooled back into the pool
+                //
+                // this test makes sure that doing so will unpark the checkout
+                pooled.idle();
+                Ok(())
+            }))
+            .map(|(entry, _)| entry);
         assert_eq!(*checkout.wait().unwrap(), *pooled1);
     }
 }
